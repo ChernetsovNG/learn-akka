@@ -2,6 +2,7 @@ package ru.nchernetsov.IoT;
 
 import akka.actor.ActorRef;
 import akka.actor.ActorSystem;
+import akka.actor.PoisonPill;
 import akka.testkit.TestKit;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
@@ -9,6 +10,8 @@ import org.junit.Test;
 import scala.concurrent.duration.FiniteDuration;
 
 import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 import static org.junit.Assert.*;
 
@@ -74,5 +77,56 @@ public class DeviceGroupTest {
         ActorRef deviceActor2 = probe.lastSender();
 
         assertEquals(deviceActor1, deviceActor2);
+    }
+
+    @Test
+    public void testListActiveDevices() {
+        TestKit probe = new TestKit(system);
+        ActorRef groupActor = system.actorOf(DeviceGroup.props("group"));
+
+        groupActor.tell(new DeviceManager.RequestTrackDevice("group", "device1"), probe.testActor());
+        probe.expectMsgClass(DeviceManager.DeviceRegistered.class);
+
+        groupActor.tell(new DeviceManager.RequestTrackDevice("group", "device2"), probe.testActor());
+        probe.expectMsgClass(DeviceManager.DeviceRegistered.class);
+
+        groupActor.tell(new DeviceGroup.RequestDeviceList(0L), probe.testActor());
+        DeviceGroup.ReplyDeviceList reply = probe.expectMsgClass(DeviceGroup.ReplyDeviceList.class);
+        assertEquals(0L, reply.requestId);
+        assertEquals(Stream.of("device1", "device2").collect(Collectors.toSet()), reply.ids);
+    }
+
+    @Test
+    public void testListActiveDevicesAfterOneShutsDown() {
+        TestKit probe = new TestKit(system);
+        ActorRef groupActor = system.actorOf(DeviceGroup.props("group"));
+
+        groupActor.tell(new DeviceManager.RequestTrackDevice("group", "device1"), probe.testActor());
+        probe.expectMsgClass(DeviceManager.DeviceRegistered.class);
+        ActorRef toShutDown = probe.lastSender();
+
+        groupActor.tell(new DeviceManager.RequestTrackDevice("group", "device2"), probe.testActor());
+        probe.expectMsgClass(DeviceManager.DeviceRegistered.class);
+
+        groupActor.tell(new DeviceGroup.RequestDeviceList(0L), probe.testActor());
+        DeviceGroup.ReplyDeviceList reply = probe.expectMsgClass(DeviceGroup.ReplyDeviceList.class);
+        assertEquals(0L, reply.requestId);
+        assertEquals(Stream.of("device1", "device2").collect(Collectors.toSet()), reply.ids);
+
+        probe.watch(toShutDown);
+        toShutDown.tell(PoisonPill.getInstance(), ActorRef.noSender());
+        probe.expectTerminated(toShutDown, new FiniteDuration(1L, TimeUnit.SECONDS));
+
+        // using awaitAssert to retry because it might take longer for the groupActor
+        // to see the Terminated, that order is undefined
+        probe.awaitAssert(() -> {
+           groupActor.tell(new DeviceGroup.RequestDeviceList(1L), probe.testActor());
+            DeviceGroup.ReplyDeviceList r = probe.expectMsgClass(DeviceGroup.ReplyDeviceList.class);
+            assertEquals(1L, r.requestId);
+            assertEquals(Stream.of("device2").collect(Collectors.toSet()), r.ids);
+            return null;
+        },
+            new FiniteDuration(10L, TimeUnit.SECONDS),
+            new FiniteDuration(10L, TimeUnit.SECONDS));
     }
 }
